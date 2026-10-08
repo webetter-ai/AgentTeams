@@ -814,6 +814,8 @@ def push_local(sync: FileSync, since: float = 0) -> list[str]:
         ".qwenpaw/workspaces/default/global-shared",
         "shared",
         "global-shared",
+        # Control-plane -> worker delivery directory; pulled only, never pushed.
+        "inbox",
     )
     # Directory name components to skip anywhere in the tree
     _EXCLUDE_DIRS = {

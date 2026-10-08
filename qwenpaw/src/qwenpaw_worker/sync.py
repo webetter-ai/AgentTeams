@@ -3,18 +3,51 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
+import json
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
+import tempfile
 import time
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MC_ALIAS = "agentteams"
 COMPARE_CONTENT_MAX_BYTES = 20 * 1024 * 1024
+# Control-plane -> worker delivery directory. Objects under
+# ``<remote_prefix>/inbox/`` are written (and deleted) by the control plane;
+# the worker only mirrors them locally and never pushes this directory back.
+INBOX_DIRNAME = "inbox"
+_INBOX_PARTIAL_SUFFIX = ".inbox-partial"
+
+
+@dataclass
+class InboxPullResult:
+    downloaded: List[str] = field(default_factory=list)
+    removed: List[str] = field(default_factory=list)
+    failed: List[str] = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.downloaded or self.removed)
+
+
+def _safe_inbox_relpath(key: str) -> Optional[str]:
+    """Return a normalized relative POSIX path, or None if the key is unsafe."""
+
+    key = key.replace("\\", "/")
+    if not key or key.endswith("/") or key.startswith("/"):
+        return None
+    parts = PurePosixPath(key).parts
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    if parts[-1].endswith(_INBOX_PARTIAL_SUFFIX):
+        return None
+    return "/".join(parts)
 
 
 def _to_text(value: object) -> str:
@@ -81,6 +114,9 @@ class FileSync:
         self.shared_prefix = (shared_prefix or "shared").strip("/")
         self.mc_alias = _storage_alias()
         self._alias_set = False
+        # Remote object signature (etag/size/mtime) of each inbox file this
+        # process has downloaded, keyed by path relative to inbox/.
+        self._inbox_signatures: Dict[str, str] = {}
 
     def _mc(self, *args: str, check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
         mc_bin = shutil.which("mc")
@@ -213,6 +249,146 @@ class FileSync:
             return False
         raise RuntimeError(f"pull runtime config failed: {_mc_error_message(result)}")
 
+    def _list_inbox(self, remote_prefix: str) -> Dict[str, str]:
+        """List remote inbox objects as ``{relative_path: signature}``.
+
+        Raises on any listing error or unparseable output so that callers never
+        delete local files based on an incomplete listing. A missing prefix is
+        an empty inbox.
+        """
+
+        result = self._mc(
+            "ls",
+            "--recursive",
+            "--json",
+            f"{self._object_path(remote_prefix)}/",
+            check=False,
+        )
+        objects: Dict[str, str] = {}
+        errors: List[str] = []
+        for line in _to_text(result.stdout).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                raise RuntimeError("list inbox failed: unparseable mc ls output") from None
+            if not isinstance(entry, dict):
+                raise RuntimeError("list inbox failed: unexpected mc ls output")
+            if entry.get("status") == "error":
+                errors.append(json.dumps(entry.get("error"), sort_keys=True))
+                continue
+            if entry.get("type") != "file":
+                continue
+            rel = _safe_inbox_relpath(str(entry.get("key") or ""))
+            if rel is None:
+                logger.warning(
+                    "skipping unsafe inbox object key component=sync worker=%s key=%r",
+                    self.worker_name,
+                    entry.get("key"),
+                )
+                continue
+            objects[rel] = "|".join(str(entry.get(name, "")) for name in ("etag", "size", "lastModified"))
+        if result.returncode != 0 or errors:
+            detail = " ".join([*errors, _to_text(result.stderr)]).strip()
+            if not objects and _looks_like_missing_object_error(detail):
+                return {}
+            raise RuntimeError(f"list inbox failed: {detail or f'mc exited with status {result.returncode}'}")
+        return objects
+
+    def _download_inbox_object(self, key: str, target: Path) -> bool:
+        """Download one object atomically (temp file + rename). False if it vanished."""
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=_INBOX_PARTIAL_SUFFIX,
+        )
+        os.close(fd)
+        try:
+            result = self._mc("cp", self._object_path(key), tmp_name, check=False)
+            if result.returncode != 0:
+                if _looks_like_missing_object_error(result.stderr):
+                    return False
+                raise RuntimeError(f"pull inbox object failed: {_mc_error_message(result)}")
+            os.replace(tmp_name, target)
+            return True
+        finally:
+            if os.path.lexists(tmp_name):
+                os.unlink(tmp_name)
+
+    def pull_inbox(self) -> InboxPullResult:
+        """Mirror ``<remote_prefix>/inbox/`` into ``<local_dir>/inbox/``.
+
+        New or changed remote objects are downloaded; local files whose remote
+        object no longer exists (e.g. deleted by the control plane after the
+        worker acknowledged it) are removed. Deletion is confined to the local
+        inbox directory and only happens after a complete, successful listing.
+        """
+
+        self.ensure_alias()
+        outcome = InboxPullResult()
+        local_inbox = self.local_dir / INBOX_DIRNAME
+        if local_inbox.is_symlink():
+            raise RuntimeError(f"local inbox is a symlink, refusing to sync: {local_inbox}")
+        remote_prefix = f"{self.remote_prefix}/{INBOX_DIRNAME}"
+        remote = self._list_inbox(remote_prefix)
+
+        for rel, signature in sorted(remote.items()):
+            target = local_inbox.joinpath(*rel.split("/"))
+            if (
+                self._inbox_signatures.get(rel) == signature
+                and target.is_file()
+                and not target.is_symlink()
+            ):
+                continue
+            try:
+                if target.is_symlink():
+                    target.unlink()
+                if not self._download_inbox_object(f"{remote_prefix}/{rel}", target):
+                    continue
+            except Exception as exc:
+                # Leave the signature unset so the next tick retries this object.
+                outcome.failed.append(rel)
+                logger.warning(
+                    "inbox object pull failed component=sync worker=%s file=%s error_type=%s",
+                    self.worker_name,
+                    rel,
+                    type(exc).__name__,
+                )
+                continue
+            self._inbox_signatures[rel] = signature
+            outcome.downloaded.append(rel)
+
+        if local_inbox.is_dir():
+            for root, dirs, files in os.walk(local_inbox, topdown=False, followlinks=False):
+                root_path = Path(root)
+                for name in files:
+                    path = root_path / name
+                    rel = path.relative_to(local_inbox).as_posix()
+                    if rel in remote:
+                        continue
+                    path.unlink()
+                    if not name.endswith(_INBOX_PARTIAL_SUFFIX):
+                        outcome.removed.append(rel)
+                for name in dirs:
+                    path = root_path / name
+                    if path.is_symlink():
+                        path.unlink()
+                        outcome.removed.append(path.relative_to(local_inbox).as_posix())
+                        continue
+                    try:
+                        path.rmdir()
+                    except OSError:
+                        pass  # not empty: still holds mirrored files
+
+        for rel in list(self._inbox_signatures):
+            if rel not in remote:
+                del self._inbox_signatures[rel]
+        return outcome
+
     def push_paths(self, paths: Iterable[Path]) -> List[str]:
         """Persist selected worker files, raising on the first upload failure."""
 
@@ -264,6 +440,8 @@ def _skip_background_push(rel: Path) -> bool:
     rel_path = rel.as_posix()
     excluded_prefixes = (
         "credentials",
+        # Control-plane -> worker delivery; pulled by FileSync.pull_inbox, never pushed.
+        INBOX_DIRNAME,
         "runtime",
         "shared",
         "global-shared",

@@ -393,6 +393,7 @@ def test_push_local_preserves_user_data_but_skips_manager_and_mirrored_state(tmp
         ".qwenpaw/workspaces/default/global-shared/reference.md": "runtime global shared",
         "memory/note.txt": "remember this",
         "memory/shared/note.txt": "user data with shared path segment",
+        "inbox/memory-edits/e-1.json": "{}",
         "AGENTS.md": "worker prompt",
     }
     for rel, content in files.items():
