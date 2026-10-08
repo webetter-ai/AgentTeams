@@ -1,5 +1,9 @@
 #!/bin/bash
 # Runtime-neutral Local -> Remote Worker workspace synchronization.
+#
+# inbox/ is the control-plane -> Worker delivery directory: the control plane
+# writes and deletes objects under <agent prefix>/inbox/ and Workers only pull
+# it, so it is never pushed back from the Worker.
 
 worker_sync_init() {
     local state_dir="$1"
@@ -25,7 +29,7 @@ worker_sync_should_push() {
 
     case "${relative_path}" in
         openclaw.json | config/mcporter.json | mcporter-servers.json | \
-            credentials/* | .agents/* | .cache/* | .npm/* | .local/* | .mc/* | \
+            credentials/* | inbox/* | .agents/* | .cache/* | .npm/* | .local/* | .mc/* | \
             .last-pull | .openclaw/matrix/* | .openclaw/canvas/* | *.lock)
             return 1
             ;;
@@ -40,7 +44,7 @@ worker_sync_mirror_all() {
     mc mirror "${workspace}/" "${remote_prefix}/" --overwrite \
         --exclude "openclaw.json" \
         --exclude "config/mcporter.json" --exclude "mcporter-servers.json" --exclude ".agents/**" \
-        --exclude "credentials/**" \
+        --exclude "credentials/**" --exclude "inbox/**" \
         --exclude ".cache/**" --exclude ".npm/**" \
         --exclude ".local/**" --exclude ".mc/**" --exclude "*.lock" \
         --exclude ".last-pull" \

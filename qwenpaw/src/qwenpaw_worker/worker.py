@@ -21,7 +21,7 @@ from qwenpaw_worker.api import QwenPawApiClient
 from qwenpaw_worker.config import WorkerConfig, _relative_storage_prefix
 from qwenpaw_worker.heartbeat import WorkerHeartbeat, run_worker_heartbeat_loop
 from qwenpaw_worker.log import configure_worker_logging
-from qwenpaw_worker.sync import FileSync, push_loop
+from qwenpaw_worker.sync import FileSync, _preview_list, push_loop
 from qwenpaw_worker.update import MemberRuntimeConfig, RuntimeUpdater
 
 logger = logging.getLogger(__name__)
@@ -153,6 +153,7 @@ class Worker:
         self.heartbeat.persist()
         self.updater.runtime_config_pull = lambda: self.sync.pull_runtime_config(self.config.runtime_config_path)
         self.updater.skill_sync = self._sync_managed_skills
+        self.updater.inbox_pull = self._pull_inbox
 
         try:
             stage_started = self._log_worker_stage_begin("load_runtime_config", path=self.config.runtime_config_path)
@@ -583,6 +584,20 @@ class Worker:
             self.sync.mirror_prefix(
                 f"{self.sync.remote_prefix}/skills/{name}",
                 self.config.default_workspace_dir / "skills" / name,
+            )
+
+    def _pull_inbox(self) -> None:
+        if self.sync is None:
+            raise RuntimeError("file sync is not initialized")
+        result = self.sync.pull_inbox()
+        if result.changed or result.failed:
+            logger.info(
+                "inbox pulled component=worker worker=%s downloaded=%d removed=%d failed=%d files=%s",
+                self.config.worker_name,
+                len(result.downloaded),
+                len(result.removed),
+                len(result.failed),
+                _preview_list([*result.downloaded, *result.removed, *result.failed]),
             )
 
     def _runtime_shared_prefix(self, runtime_config) -> str:

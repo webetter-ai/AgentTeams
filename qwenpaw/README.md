@@ -31,6 +31,12 @@ QwenPaw localhost HTTP API.
 - Persist eligible local runtime changes back to object storage.
 - Exclude credentials, shared projections, logs, tool results,
   media, file store, and other runtime cache paths from background push.
+- Treat `agents/{memberName}/inbox/` as a control-plane -> worker delivery
+  directory: on every desired-state poll tick (same interval as
+  `runtime.yaml`) the worker mirrors it into the local `inbox/`, downloading
+  new or changed objects and deleting local files whose object was removed.
+  `inbox/` is never pushed back; deletion only happens inside the local
+  `inbox/` and only after a complete, successful listing.
 
 ### 1.3 Desired-State Apply
 

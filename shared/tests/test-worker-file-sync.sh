@@ -91,7 +91,8 @@ test_manager_owned_and_local_runtime_files_stay_local() {
     state_dir="${tmpdir}/state"
     remote_prefix="agentteams/agentteams-storage/agents/alice"
     mkdir -p "${workspace}/results" "${workspace}/credentials" \
-        "${workspace}/.openclaw/matrix" "${state_dir}" "${tmpdir}/bin"
+        "${workspace}/.openclaw/matrix" "${workspace}/inbox/memory-edits" \
+        "${state_dir}" "${tmpdir}/bin"
 
     cat > "${tmpdir}/bin/mc" <<'EOF'
 #!/bin/bash
@@ -107,12 +108,13 @@ EOF
     printf '{}\n' > "${workspace}/openclaw.json"
     printf 'secret\n' > "${workspace}/credentials/token"
     printf 'crypto\n' > "${workspace}/.openclaw/matrix/state"
+    printf '{}\n' > "${workspace}/inbox/memory-edits/e-1.json"
     printf 'task result\n' > "${workspace}/results/output.md"
 
     worker_sync_push_once "${workspace}" "${remote_prefix}" "${state_dir}"
 
     [ "$(wc -l < "${FAKE_MC_LOG}" | tr -d ' ')" = "1" ] ||
-        fail "manager-owned or local runtime files were uploaded"
+        fail "manager-owned, inbox or local runtime files were uploaded"
     grep -Fq "${workspace}/results/output.md" "${FAKE_MC_LOG}" ||
         fail "ordinary workspace file was not uploaded"
 
@@ -149,6 +151,8 @@ EOF
         fail "large change set did not collapse to one operation"
     grep -Fq "mirror ${workspace}/ ${remote_prefix}/ --overwrite" "${FAKE_MC_LOG}" ||
         fail "large change set did not use mirror"
+    grep -Fq -- "--exclude inbox/**" "${FAKE_MC_LOG}" ||
+        fail "large change set mirror does not exclude inbox/"
 
     unset AGENTTEAMS_WORKER_SYNC_MIRROR_THRESHOLD
     rm -rf "${tmpdir}"

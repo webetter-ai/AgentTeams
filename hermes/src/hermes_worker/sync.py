@@ -635,6 +635,9 @@ def push_local(sync: FileSync, since: float = 0) -> list[str]:
             continue
         if rel.as_posix() in _EXCLUDE_PATHS:
             continue
+        # Control-plane -> worker delivery directory; pulled only, never pushed.
+        if rel.parts[0] == "inbox":
+            continue
         if any(p in _EXCLUDE_DIRS for p in rel.parts):
             continue
         if rel.suffix in _EXCLUDE_EXTENSIONS:
