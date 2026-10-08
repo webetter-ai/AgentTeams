@@ -2821,3 +2821,46 @@ member:
 class _NoopPackageManager:
     def apply(self, _runtime_config: MemberRuntimeConfig):
         return None
+
+
+@pytest.mark.anyio
+async def test_runtime_update_loop_pulls_inbox_each_tick_and_survives_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _config(tmp_path)
+    calls: list[str] = []
+    inbox_results: list[object] = [RuntimeError("list inbox failed secret-token-value"), None]
+
+    def inbox_pull() -> None:
+        calls.append("inbox")
+        value = inbox_results.pop(0)
+        if isinstance(value, Exception):
+            raise value
+
+    updater = _runtime_updater(config=config, inbox_pull=inbox_pull)
+    caplog.set_level(logging.INFO, logger="qwenpaw_worker.update")
+    sleeps = 0
+
+    async def sleep_tick(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 2:
+            raise asyncio.CancelledError
+
+    def fake_load_and_apply_once(self):
+        calls.append("runtime")
+        raise RuntimeError("runtime config parse failed")
+
+    monkeypatch.setattr("qwenpaw_worker.update.asyncio.sleep", sleep_tick)
+    monkeypatch.setattr("qwenpaw_worker.update.RuntimeUpdater._load_and_apply_once", fake_load_and_apply_once)
+
+    with pytest.raises(asyncio.CancelledError):
+        await updater.loop()
+
+    # Same tick, same interval: runtime config first, then inbox; a failure in
+    # either does not stop the other or the loop.
+    assert calls == ["runtime", "inbox", "runtime", "inbox"]
+    assert "inbox pull failed component=update" in caplog.text
+    assert "secret-token-value" not in caplog.text

@@ -1295,8 +1295,12 @@ class RuntimeUpdater:
         runtime_reconcile: Optional[Callable[[MemberRuntimeConfig], None]] = None,
         skill_sync: Optional[Callable[[List[str]], None]] = None,
         adapter_force_apply: Optional[Callable[[], None]] = None,
+        inbox_pull: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.config = config
+        # Optional hook run on every poll tick, after the runtime config
+        # pull/apply, to fetch control-plane -> worker files (inbox/).
+        self.inbox_pull = inbox_pull
         self.adapter_apply = adapter_apply
         self.adapter_force_apply = adapter_force_apply
         self.runtime_config_pull = runtime_config_pull
@@ -2212,6 +2216,19 @@ class RuntimeUpdater:
                         type(exc).__name__,
                         _duration_ms(started_at),
                     )
+                if self.inbox_pull is not None:
+                    try:
+                        started_at = time.monotonic()
+                        await asyncio.to_thread(self.inbox_pull)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "inbox pull failed component=update worker=%s error_type=%s duration_ms=%s",
+                            self.config.worker_name,
+                            type(exc).__name__,
+                            _duration_ms(started_at),
+                        )
         except asyncio.CancelledError:
             logger.info("runtime config update loop stopped component=update worker=%s", self.config.worker_name)
             raise

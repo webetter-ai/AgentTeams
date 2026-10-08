@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -141,6 +142,7 @@ def test_push_local_uploads_worker_files_but_skips_controller_owned_state(tmp_pa
         "credentials/token": "secret",
         "shared/tasks/t-1/result.md": "team shared",
         "global-shared/reference.md": "global shared",
+        "inbox/memory-edits/e-1.json": '{"edit_id":"e-1"}',
     }
     for rel, content in files.items():
         path = sync.local_dir / rel
@@ -173,6 +175,7 @@ def test_push_local_uploads_worker_files_but_skips_controller_owned_state(tmp_pa
     assert not any("credentials" in item for item in pushed)
     assert not any("logs/" in item for item in pushed)
     assert not any("shared/" in item for item in pushed)
+    assert not any(item.startswith("inbox/") for item in pushed)
     assert set(uploads) == {
         "agentteams/agentteams-storage/agents/worker-a/SOUL.md",
         "agentteams/agentteams-storage/agents/worker-a/.qwenpaw/workspaces/default/AGENTS.md",
@@ -382,3 +385,182 @@ async def test_push_loop_starts_from_current_time_instead_of_full_scan(
     await push_loop(sync, check_interval=0)
 
     assert since_values == [123.0]
+
+
+INBOX_REMOTE = "agentteams/agentteams-storage/agents/worker-a/inbox"
+
+
+class FakeInboxStore:
+    """Fake ``mc`` for inbox tests: ``ls --recursive --json`` and ``cp`` only."""
+
+    def __init__(self, objects: dict[str, tuple[str, bytes]]) -> None:
+        self.objects = dict(objects)  # key relative to inbox/ -> (etag, content)
+        self.commands: list[tuple] = []
+        self.ls_result: subprocess.CompletedProcess | None = None
+        self.cp_failures: dict[str, int] = {}
+
+    def __call__(self, *args, **_kwargs):
+        self.commands.append(args)
+        if args[0] == "ls":
+            assert args[1:] == ("--recursive", "--json", f"{INBOX_REMOTE}/")
+            if self.ls_result is not None:
+                return self.ls_result
+            lines = [
+                json.dumps(
+                    {
+                        "status": "success",
+                        "type": "file",
+                        "lastModified": "2026-10-08T00:00:00Z",
+                        "size": len(content),
+                        "key": key,
+                        "etag": etag,
+                    }
+                )
+                for key, (etag, content) in sorted(self.objects.items())
+            ]
+            return subprocess.CompletedProcess(args, 0, stdout="\n".join(lines), stderr="")
+        if args[0] == "cp":
+            key = args[1][len(INBOX_REMOTE) + 1 :]
+            if self.cp_failures.get(key):
+                self.cp_failures[key] -= 1
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="connection reset")
+            if key not in self.objects:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="Object does not exist")
+            Path(args[2]).write_bytes(self.objects[key][1])
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected mc command: {args}")
+
+    def downloads(self) -> list[str]:
+        return [args[1][len(INBOX_REMOTE) + 1 :] for args in self.commands if args[0] == "cp"]
+
+
+def _inbox_sync(tmp_path: Path, monkeypatch, store: FakeInboxStore) -> FileSync:
+    sync = _sync(tmp_path)
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(sync, "_mc", store)
+    return sync
+
+
+def test_pull_inbox_downloads_new_and_changed_objects_only(tmp_path: Path, monkeypatch) -> None:
+    store = FakeInboxStore(
+        {
+            "forget.json": ("etag-1", b'{"items":[]}'),
+            "memory-edits/e-1.json": ("etag-2", b'{"edit_id":"e-1"}'),
+        }
+    )
+    sync = _inbox_sync(tmp_path, monkeypatch, store)
+    inbox = sync.local_dir / "inbox"
+
+    first = sync.pull_inbox()
+
+    assert first.downloaded == ["forget.json", "memory-edits/e-1.json"]
+    assert first.removed == []
+    assert (inbox / "forget.json").read_bytes() == b'{"items":[]}'
+    assert (inbox / "memory-edits" / "e-1.json").read_bytes() == b'{"edit_id":"e-1"}'
+    assert not [p for p in inbox.rglob("*") if p.name.endswith(".inbox-partial")]
+
+    # Unchanged listing: only the ls call, no downloads.
+    store.commands.clear()
+    second = sync.pull_inbox()
+    assert second.changed is False
+    assert store.downloads() == []
+
+    # Changed etag: only that object is downloaded again.
+    store.objects["forget.json"] = ("etag-3", b'{"items":["x"]}')
+    store.commands.clear()
+    third = sync.pull_inbox()
+    assert third.downloaded == ["forget.json"]
+    assert store.downloads() == ["forget.json"]
+    assert (inbox / "forget.json").read_bytes() == b'{"items":["x"]}'
+
+
+def test_pull_inbox_removes_local_files_deleted_remotely_only_inside_inbox(tmp_path: Path, monkeypatch) -> None:
+    store = FakeInboxStore(
+        {
+            "memory-edits/e-1.json": ("etag-1", b"one"),
+            "memory-edits/e-2.json": ("etag-2", b"two"),
+            "cards/7/brief.pdf.v1": ("etag-3", b"pdf"),
+        }
+    )
+    sync = _inbox_sync(tmp_path, monkeypatch, store)
+    inbox = sync.local_dir / "inbox"
+    outside = sync.local_dir / "memory-edits" / "e-1.json"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("worker-owned file outside inbox", encoding="utf-8")
+    sync.pull_inbox()
+
+    # The control plane deletes acknowledged objects.
+    del store.objects["memory-edits/e-1.json"]
+    del store.objects["cards/7/brief.pdf.v1"]
+    result = sync.pull_inbox()
+
+    assert result.downloaded == []
+    assert sorted(result.removed) == ["cards/7/brief.pdf.v1", "memory-edits/e-1.json"]
+    assert not (inbox / "memory-edits" / "e-1.json").exists()
+    assert (inbox / "memory-edits" / "e-2.json").read_bytes() == b"two"
+    assert not (inbox / "cards").exists()
+    assert inbox.is_dir()
+    assert outside.read_text(encoding="utf-8") == "worker-owned file outside inbox"
+
+
+def test_pull_inbox_treats_missing_prefix_as_empty_inbox(tmp_path: Path, monkeypatch) -> None:
+    store = FakeInboxStore({})
+    sync = _inbox_sync(tmp_path, monkeypatch, store)
+    stale = sync.local_dir / "inbox" / "forget.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}", encoding="utf-8")
+    store.ls_result = subprocess.CompletedProcess(
+        ("ls",),
+        1,
+        stdout=json.dumps({"status": "error", "error": {"message": "Object does not exist"}}),
+        stderr="",
+    )
+
+    result = sync.pull_inbox()
+
+    assert result.removed == ["forget.json"]
+    assert not stale.exists()
+
+
+def test_pull_inbox_keeps_local_files_when_listing_fails(tmp_path: Path, monkeypatch) -> None:
+    store = FakeInboxStore({})
+    sync = _inbox_sync(tmp_path, monkeypatch, store)
+    kept = sync.local_dir / "inbox" / "forget.json"
+    kept.parent.mkdir(parents=True)
+    kept.write_text("{}", encoding="utf-8")
+    store.ls_result = subprocess.CompletedProcess(
+        ("ls",),
+        1,
+        stdout=json.dumps({"status": "error", "error": {"message": "Access Denied."}}),
+        stderr="",
+    )
+
+    with pytest.raises(RuntimeError, match="list inbox failed"):
+        sync.pull_inbox()
+    assert kept.read_text(encoding="utf-8") == "{}"
+
+    store.ls_result = subprocess.CompletedProcess(("ls",), 0, stdout="not-json", stderr="")
+    with pytest.raises(RuntimeError, match="unparseable"):
+        sync.pull_inbox()
+    assert kept.exists()
+
+
+def test_pull_inbox_skips_unsafe_keys_and_retries_failed_downloads(tmp_path: Path, monkeypatch) -> None:
+    store = FakeInboxStore(
+        {
+            "../escape.json": ("etag-1", b"escape"),
+            "ok.json": ("etag-2", b"ok"),
+        }
+    )
+    store.cp_failures["ok.json"] = 1
+    sync = _inbox_sync(tmp_path, monkeypatch, store)
+
+    first = sync.pull_inbox()
+    assert first.failed == ["ok.json"]
+    assert first.downloaded == []
+    assert not (sync.local_dir / "escape.json").exists()
+    assert not [p for p in (sync.local_dir / "inbox").rglob("*") if p.is_file()]
+
+    second = sync.pull_inbox()
+    assert second.downloaded == ["ok.json"]
+    assert (sync.local_dir / "inbox" / "ok.json").read_bytes() == b"ok"

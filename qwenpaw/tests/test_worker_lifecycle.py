@@ -1318,6 +1318,7 @@ async def test_start_reads_runtime_config_installs_adapter_and_starts_loops(
     ]
     assert "push:5" in calls
     assert "update-loop" not in calls
+    assert worker.updater.inbox_pull == worker._pull_inbox
     assert worker._initial_runtime_config is not None
     assert worker._initial_runtime_config.member_name == "worker-a"
 
