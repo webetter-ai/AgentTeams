@@ -56,6 +56,8 @@ SKOPEO_AUTH_FILE="${SKOPEO_AUTH_FILE:-${HOME}/.config/containers/auth.json}"
 IMAGES=(
     "ghcr.io/matrix-construct/tuwunel:main|tuwunel|${DATE_TAG}"
     "quay.io/minio/minio:latest|minio|${DATE_TAG}"
+    # NOTE: Dockerfiles pin the mirrored mc by digest + binary checksum
+    # (shared/tests/test-mc-pin.sh); re-mirroring does not change what is built.
     "quay.io/minio/mc:latest|mc|${DATE_TAG}"
     "docker.io/vectorim/element-web:latest|element-web|${DATE_TAG}"
     "docker.io/library/node:20-slim|node|20-slim"
