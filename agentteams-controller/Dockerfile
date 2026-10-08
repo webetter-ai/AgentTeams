@@ -24,7 +24,19 @@ RUN CGO_ENABLED=1 go build -ldflags '-extldflags "-static"' -o /agentteams-contr
 RUN CGO_ENABLED=0 go build -o /agt ./cmd/agt/
 
 # ============ Stage 2: mc (MinIO Client) ============
-FROM ${HIGRESS_REGISTRY}/higress/mc:20260216 AS mc
+FROM ${HIGRESS_REGISTRY}/higress/mc:20260216@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 AS mc
+# mc is pinned to RELEASE.2025-08-13T08-35-41Z by image digest and by binary
+# checksum. It is baked into the image and never downloaded at runtime.
+# Bump all Dockerfiles together; shared/tests/test-mc-pin.sh enforces this.
+ARG TARGETARCH
+RUN set -eu; \
+    arch="${TARGETARCH:-$(uname -m)}"; \
+    case "${arch}" in \
+        amd64|x86_64) sum=01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891 ;; \
+        arm64|aarch64) sum=14c8c9616cfce4636add161304353244e8de383b2e2752c0e9dad01d4c27c12c ;; \
+        *) echo "mc: no pinned checksum for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    echo "${sum}  /usr/bin/mc" | sha256sum -c -
 
 # ============ Stage 3: Download kube-apiserver (native arch to avoid QEMU TLS bugs) ============
 FROM --platform=$BUILDPLATFORM ${HIGRESS_REGISTRY}/higress/alpine:3.20 AS kube-bin
